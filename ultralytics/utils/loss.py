@@ -810,3 +810,81 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion((vp_feats, pred_masks, proto), batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+        import torch
+import torch.nn as nn
+
+class SIOULoss(nn.Module):
+    def __init__(self, mode='siou'):
+        super(SIOULoss, self).__init__()
+        assert mode in ['siou', 'ciou', 'diou'], "Mode must be one of 'siou', 'ciou', or 'diou'"
+        self.mode = mode
+
+    def forward(self, pred, target):
+        # Convert [x, y, w, h] to [x1, y1, x2, y2]
+        pred_x1 = pred[:, 0] - pred[:, 2] / 2
+        pred_y1 = pred[:, 1] - pred[:, 3] / 2
+        pred_x2 = pred[:, 0] + pred[:, 2] / 2
+        pred_y2 = pred[:, 1] + pred[:, 3] / 2
+
+        target_x1 = target[:, 0] - target[:, 2] / 2
+        target_y1 = target[:, 1] - target[:, 3] / 2
+        target_x2 = target[:, 0] + target[:, 2] / 2
+        target_y2 = target[:, 1] + target[:, 3] / 2
+
+        pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
+        target_area = (target_x2 - target_x1) * (target_y2 - target_y1)
+
+        inter_x1 = torch.max(pred_x1, target_x1)
+        inter_y1 = torch.max(pred_y1, target_y1)
+        inter_x2 = torch.min(pred_x2, target_x2)
+        inter_y2 = torch.min(pred_y2, target_y2)
+
+        inter_w = (inter_x2 - inter_x1).clamp(min=0)
+        inter_h = (inter_y2 - inter_y1).clamp(min=0)
+        inter_area = inter_w * inter_h
+
+        union = pred_area + target_area - inter_area
+        iou = inter_area / union.clamp(min=1e-7)
+
+        if self.mode == 'diou' or self.mode == 'ciou' or self.mode == 'siou':
+            # Centers of boxes
+            center_pred_x = (pred_x1 + pred_x2) / 2
+            center_pred_y = (pred_y1 + pred_y2) / 2
+            center_target_x = (target_x1 + target_x2) / 2
+            center_target_y = (target_y1 + target_y2) / 2
+
+            center_dist = (center_pred_x - center_target_x) ** 2 + (center_pred_y - center_target_y) ** 2
+            enc_x1 = torch.min(pred_x1, target_x1)
+            enc_y1 = torch.min(pred_y1, target_y1)
+            enc_x2 = torch.max(pred_x2, target_x2)
+            enc_y2 = torch.max(pred_y2, target_y2)
+            enc_diag = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2
+            diou_term = center_dist / enc_diag.clamp(min=1e-7)
+
+        if self.mode == 'diou':
+            return 1 - iou + diou_term
+
+        if self.mode == 'ciou' or self.mode == 'siou':
+            pred_w = pred_x2 - pred_x1
+            pred_h = pred_y2 - pred_y1
+            target_w = target_x2 - target_x1
+            target_h = target_y2 - target_y1
+
+            v = (4 / (math.pi ** 2)) * torch.pow(
+                torch.atan(target_w / target_h) - torch.atan(pred_w / pred_h), 2)
+            with torch.no_grad():
+                alpha = v / (1 - iou + v).clamp(min=1e-7)
+
+            if self.mode == 'ciou':
+                return 1 - iou + diou_term + alpha * v
+
+            if self.mode == 'siou':
+                # Angle cost
+                theta = torch.atan(target_h / target_w) - torch.atan(pred_h / pred_w)
+                angle_cost = 4 / (math.pi ** 2) * theta ** 2
+
+                gamma = angle_cost + diou_term + alpha * v
+                return 1 - iou + gamma
+
+        return 1 - iou
+
