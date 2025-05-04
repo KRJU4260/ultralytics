@@ -1,8 +1,58 @@
+
+import math
+import torch
+import torch.nn as nn
+
+class SIOUloss(nn.Module):
+    def __init__(self):
+        super(SIOUloss, self).__init__()
+
+    def forward(self, pred, target):
+        pred = pred.float()
+        target = target.float()
+
+        pred_cx = (pred[..., 0] + pred[..., 2]) / 2
+        pred_cy = (pred[..., 1] + pred[..., 3]) / 2
+        pred_w = pred[..., 2] - pred[..., 0]
+        pred_h = pred[..., 3] - pred[..., 1]
+
+        target_cx = (target[..., 0] + target[..., 2]) / 2
+        target_cy = (target[..., 1] + target[..., 3]) / 2
+        target_w = target[..., 2] - target[..., 0]
+        target_h = target[..., 3] - target[..., 1]
+
+        inter_x1 = torch.max(pred[..., 0], target[..., 0])
+        inter_y1 = torch.max(pred[..., 1], target[..., 1])
+        inter_x2 = torch.min(pred[..., 2], target[..., 2])
+        inter_y2 = torch.min(pred[..., 3], target[..., 3])
+
+        inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+        union_area = pred_w * pred_h + target_w * target_h - inter_area + 1e-7
+        iou = inter_area / union_area
+
+        center_dist = (pred_cx - target_cx)**2 + (pred_cy - target_cy)**2
+
+        enclose_x1 = torch.min(pred[..., 0], target[..., 0])
+        enclose_y1 = torch.min(pred[..., 1], target[..., 1])
+        enclose_x2 = torch.max(pred[..., 2], target[..., 2])
+        enclose_y2 = torch.max(pred[..., 3], target[..., 3])
+        enclose_diag = (enclose_x2 - enclose_x1)**2 + (enclose_y2 - enclose_y1)**2 + 1e-7
+
+        v = (4 / (math.pi ** 2)) * torch.pow(torch.atan(target_w / target_h) - torch.atan(pred_w / pred_h), 2)
+        with torch.no_grad():
+            alpha = v / (1 - iou + v + 1e-7)
+
+        siou = 1 - iou + (center_dist / enclose_diag) + alpha * v
+        return siou
+
+
+
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
@@ -103,12 +153,15 @@ class BboxLoss(nn.Module):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.siou_loss = SIOUloss()  # Use SIOU instead of DIoU
 
     def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
-        """Compute IoU and DFL losses for bounding boxes."""
+        """Compute SIOU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=False, DIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        
+        # Use SIOU instead of DIoU
+        siou = self.siou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask])
+        loss_iou = (siou * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -181,7 +234,7 @@ class v8DetectionLoss:
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxSIoULoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets, batch_size, scale_tensor):
