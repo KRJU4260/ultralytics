@@ -1,4 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+from ultralytics.utils.loss import SIOULoss
 
 import contextlib
 import pickle
